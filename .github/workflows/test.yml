@@ -1,0 +1,240 @@
+
+name: Build 25.12
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 1,16 * *"
+
+# 允许 GITHUB_TOKEN 创建和更新 Release
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-25.12
+  TZ: Asia/Shanghai
+  CCACHE_DIR: /workdir/openwrt/.ccache
+  CCACHE_MAXSIZE: 4G
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update > /dev/null
+          sudo -E apt-get -qq install -y $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) > /dev/null
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown "$USER:$(id -gn)" /workdir
+
+      - name: Clone source code
+        id: source
+        working-directory: /workdir
+        shell: bash
+        run: |
+          git clone "$REPO_URL" -b "$REPO_BRANCH" --single-branch --depth=1 openwrt
+
+          ln -sfn /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
+
+          echo "FILE_DATE=$(date +'%Y%m%d')" >> "$GITHUB_ENV"
+          echo "commit=$(git -C /workdir/openwrt rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          mkdir -p /workdir/openwrt/dl
+          mkdir -p /workdir/openwrt/.ccache
+
+      # 缓存下载源码。
+      # 源码提交或自定义构建配置改变时创建新的缓存键。
+      - name: Cache OpenWrt dl
+        uses: actions/cache@v4
+        with:
+          path: /workdir/openwrt/dl
+          key: ${{ runner.os }}-immortalwrt-25.12-armsr-dl-${{ steps.source.outputs.commit }}-${{ hashFiles('armsr/armv8/N1/.config', 'armsr/armv8/diy/diy.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-immortalwrt-25.12-armsr-dl-
+
+      - name: Update and install feeds
+        working-directory: ./openwrt
+        shell: bash
+        run: |
+          ./scripts/feeds update -a
+          bash "$GITHUB_WORKSPACE/armsr/armv8/diy/diy.sh"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load N1 custom config
+        shell: bash
+        run: |
+          rm -rf openwrt/files openwrt/.config
+
+          mv armsr/armv8/N1/files armsr/armv8/N1/.config openwrt/
+
+          # 启用 OpenWrt 编译器缓存
+          sed -i '/^CONFIG_CCACHE=/d; /^# CONFIG_CCACHE is not set$/d' openwrt/.config
+          echo 'CONFIG_CCACHE=y' >> openwrt/.config
+
+      # ccache 是编译对象缓存，不等同于交叉编译工具链缓存。
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /workdir/openwrt/.ccache
+          key: ${{ runner.os }}-immortalwrt-25.12-armsr-ccache-${{ steps.source.outputs.commit }}-${{ hashFiles('armsr/armv8/N1/.config', 'armsr/armv8/diy/diy.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-immortalwrt-25.12-armsr-ccache-${{ hashFiles('armsr/armv8/N1/.config', 'armsr/armv8/diy/diy.sh') }}-
+            ${{ runner.os }}-immortalwrt-25.12-armsr-ccache-
+
+      # 交叉编译工具链缓存仅匹配相同源码提交及构建配置。
+      # 不设置宽泛的 restore-keys，避免直接恢复其他源码版本的工具链。
+      - name: Cache cross-compilation toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            /workdir/openwrt/staging_dir/toolchain-*
+            /workdir/openwrt/build_dir/toolchain-*
+          key: ${{ runner.os }}-immortalwrt-25.12-armsr-toolchain-${{ steps.source.outputs.commit }}-${{ hashFiles('armsr/armv8/N1/.config', 'armsr/armv8/diy/diy.sh') }}
+
+      - name: Download package sources
+        working-directory: ./openwrt
+        shell: bash
+        run: |
+          make defconfig
+          make download -j"$(( $(nproc) * 2 ))"
+
+      - name: Compile N1 firmware
+        working-directory: ./openwrt
+        shell: bash
+        run: |
+          make -j"$(( $(nproc) + 1 ))" || make -j1 V=s
+
+      - name: Package N1 firmware
+        uses: ophub/amlogic-s9xxx-openwrt@main
+        with:
+          openwrt_path: openwrt/bin/targets/armsr/armv8/*rootfs.tar.gz
+          openwrt_board: s905d
+          kernel_usage: flippy
+          openwrt_kernel: 6.12.y
+          openwrt_size: 256/1024
+          builder_name: nantayo
+
+      # 先检查打包输出，再统一复制到工作区。
+      # 即使后面的 Release 上传失败，也能从 Actions Artifacts 获取固件。
+      - name: Validate and collect firmware
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "打包状态: ${PACKAGED_STATUS:-未设置}"
+          echo "打包输出目录: ${PACKAGED_OUTPUTPATH:-未设置}"
+
+          if [[ "${PACKAGED_STATUS:-}" != "success" ]]; then
+            echo "::error::OPHUB 打包状态不是 success。"
+            exit 1
+          fi
+
+          if [[ -z "${PACKAGED_OUTPUTPATH:-}" || ! -d "$PACKAGED_OUTPUTPATH" ]]; then
+            echo "::error::打包输出目录不存在。"
+            exit 1
+          fi
+
+          echo "打包目录中的文件："
+          find "$PACKAGED_OUTPUTPATH" -maxdepth 2 -type f -printf '%p (%s bytes)\n'
+
+          shopt -s nullglob
+          files=( "$PACKAGED_OUTPUTPATH"/*.img.gz )
+
+          # 兼容只生成未压缩 img 文件的情况
+          if (( ${#files[@]} == 0 )); then
+            files=( "$PACKAGED_OUTPUTPATH"/*.img )
+          fi
+
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::打包目录中没有找到 .img.gz 或 .img 固件。"
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/firmware-out"
+          cp -fv "${files[@]}" "$GITHUB_WORKSPACE/firmware-out/"
+
+          echo "最终待上传固件："
+          ls -lh "$GITHUB_WORKSPACE/firmware-out"
+
+      - name: Backup firmware to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: N1-ImmortalWrt-${{ env.FILE_DATE }}
+          path: firmware-out/*
+          if-no-files-found: error
+          retention-days: 7
+
+      # 不再吞掉 Release 创建错误；路径和文件已在前一步验证。
+      - name: Upload firmware to Release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          tag="OpenWrt_${FILE_DATE}"
+          notes=$'首次使用建议全新刷写\n\n基本信息\nIP: 192.168.2.2\n账户: root\n密码: password'
+
+          shopt -s nullglob
+          files=(
+            "$GITHUB_WORKSPACE"/firmware-out/*.img.gz
+            "$GITHUB_WORKSPACE"/firmware-out/*.img
+          )
+
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::firmware-out 中没有可上传的固件。"
+            exit 1
+          fi
+
+          echo "Release 标签: $tag"
+          echo "准备上传以下文件："
+          printf '  %s\n' "${files[@]}"
+
+          # 已存在同名 Release 则复用，否则创建。
+          # 如果创建失败，直接显示真实错误并停止。
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release 已存在，将更新其中的固件。"
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$tag" \
+            "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          echo "固件已上传到 Release：$tag"
+
+      - name: Delete old OpenWrt releases
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # 只清理本工作流生成的日期标签，保留最近两个。
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName \
+            --jq '.[].tagName' \
+            | grep -E '^OpenWrt_[0-9]{8}$' \
+            | tail -n +3 \
+            | while IFS= read -r old_tag; do
+                [[ -n "$old_tag" ]] || continue
+
+                echo "删除旧 Release: $old_tag"
+                gh release delete "$old_tag" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --cleanup-tag \
+                  --yes
+              done
